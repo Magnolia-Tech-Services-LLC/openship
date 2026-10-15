@@ -1164,6 +1164,8 @@ async function executeBuildAndDeploy(
           serverExecutor: clonePlan.cloneRunsOnTarget ? targetExecutor : null,
           repoUrl: snapshot.repoUrl,
           onLog: (message) => logger.log(message),
+          // Read .gitmodules at the deployed ref for submodule token expansion.
+          gitRef: dep.commitSha ?? dep.branch ?? null,
         })
       : {};
 

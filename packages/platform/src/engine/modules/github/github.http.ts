@@ -222,3 +222,39 @@ export async function isPublicRepo(owner: string, repo: string): Promise<boolean
   }
   return false;
 }
+
+/**
+ * Three-way anonymous visibility probe (Magnolia, oblien/openship#979 follow-up).
+ * Unlike `isPublicRepo`, which collapses every failure to "not known public",
+ * this separates a DEFINITIVE anonymous 404 ("private or missing": an anonymous
+ * clone is certain to fail with "Repository not found") from "unknown"
+ * (rate-limited, network error, 5xx), so a caller can fail loudly on the former
+ * without breaking public repos when the probe itself is throttled.
+ */
+export type AnonymousRepoVisibility = "public" | "not-found" | "unknown";
+
+export async function probeAnonymousRepoVisibility(
+  owner: string,
+  repo: string,
+  apiBase = "https://api.github.com",
+): Promise<AnonymousRepoVisibility> {
+  if (!owner || !repo) return "unknown";
+  try {
+    const res = await timedFetch(
+      `${apiBase.replace(/\/+$/, "")}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`,
+      {
+        method: "GET",
+        headers: { Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" },
+      },
+    );
+    if (res.status === 404) return "not-found";
+    if (res.ok) {
+      const data = (await res.json().catch(() => null)) as { private?: boolean } | null;
+      if (data?.private === false) return "public";
+      if (data?.private === true) return "not-found";
+    }
+  } catch (diagnosticFailure) {
+    observeCaughtError(diagnosticFailure, "platform/engine/modules/github/github.http");
+  }
+  return "unknown";
+}

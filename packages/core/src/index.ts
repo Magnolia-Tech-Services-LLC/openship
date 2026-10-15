@@ -48,6 +48,7 @@ export * from "./rollback-window";
 export * from "./deployment-history";
 export * from "./secret-keys";
 export * from "./credentials";
+export * from "./url-credentials";
 export * from "./workspaces";
 export * from "./connectivity";
 export * from "./cloud-capability";

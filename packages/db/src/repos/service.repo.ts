@@ -2,6 +2,7 @@ import { eq, and, asc, inArray, or, sql } from "drizzle-orm";
 import {
   commandToArgv,
   generateId,
+  redactUrlCredentials,
   sortJsonKeys,
   mergeAdvanced,
   normalizeCustomHostname,
@@ -1282,6 +1283,8 @@ export function createServiceRepo(db: Database, encryption: ConfigurationEncrypt
     }) {
       const now = new Date();
       const status = data.status ?? "failure";
+      // Raw build/clone output can echo a credentialed clone URL; never persist it.
+      data = { ...data, errorMessage: redactUrlCredentials(data.errorMessage) };
 
       const set: Partial<NewServiceDeployment> = {
         serviceName: data.serviceName,

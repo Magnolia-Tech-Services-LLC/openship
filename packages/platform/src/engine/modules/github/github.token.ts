@@ -74,6 +74,7 @@ import {
 import { canUseGitHubRepo, type GitHubAccessOp } from "./github-access";
 import type { ExecutionContext as RequestContext } from "@repo/platform";
 import { mayUseInstanceGitIdentity } from "./github-instance-access";
+import { installationTokenRepositories, MAX_SUBMODULE_REPOS } from "./gitmodules";
 
 // ─── Public types ───────────────────────────────────────────────────────────
 
@@ -134,6 +135,15 @@ export interface TokenContext {
   /** Skip sources already rejected during this read. Does not change the
    *  chain's order, permissions, or which kinds are available on this platform. */
   exclude?: GitHubTokenSource[];
+  /**
+   * Magnolia (oblien/openship#979): extra bare repo names under the SAME owner to
+   * include when minting an App installation token, i.e. private submodules the
+   * clone will recurse into. The parent `repo` is always included. Each extra is
+   * authorized through the same github-access gate as `repo` before it widens
+   * the token; unauthorized names are dropped. Capped (MAX_SUBMODULE_REPOS).
+   * Only the app-installation step reads this.
+   */
+  extraRepositories?: string[];
 }
 
 // ─── The dispatcher ─────────────────────────────────────────────────────────
@@ -267,6 +277,7 @@ export const SPECS: Record<GitHubTokenSource, CredentialSpec> = {
         c.tokenCtx.owner,
         c.tokenCtx.installationId,
         c.tokenCtx.repo,
+        await authorizedExtraRepositories(c),
       );
     },
     probe: async (c) => {
@@ -581,10 +592,13 @@ async function tryInstallationToken(
   owner: string,
   installationId?: number,
   repo?: string,
+  extraRepositories?: string[],
 ): Promise<string | null> {
   try {
     return await getInstallationToken(ctx, owner, installationId, {
-      repositories: repo ? [repo] : undefined,
+      // Parent first, then authorized same-owner submodules (empty extras keep
+      // upstream's exact `[repo]` narrowing).
+      repositories: installationTokenRepositories(repo, extraRepositories),
     });
   } catch (err) {
     errorDiagnostics.warn("platform/engine/modules/github/github.token",
@@ -594,6 +608,37 @@ async function tryInstallationToken(
     );
     return null;
   }
+}
+
+/**
+ * Filter `tokenCtx.extraRepositories` through the same github-access gate the
+ * parent repo cleared, so submodule expansion can never widen a token past the
+ * caller's grant. The parent must name a repo (an owner-level mint is already
+ * as wide as it gets).
+ */
+async function authorizedExtraRepositories(c: ChainCtx): Promise<string[] | undefined> {
+  const owner = c.tokenCtx.owner;
+  const extras = c.tokenCtx.extraRepositories;
+  if (!owner || !c.tokenCtx.repo || !extras?.length) return undefined;
+  const candidates = (installationTokenRepositories(undefined, extras, MAX_SUBMODULE_REPOS) ?? [])
+    .filter((name) => name.toLowerCase() !== c.tokenCtx.repo!.toLowerCase());
+  const allowed: string[] = [];
+  for (const name of candidates) {
+    const ok = await canUseGitHubRepo(
+      c.ctx,
+      { owner, repo: name, installationId: c.tokenCtx.installationId },
+      c.tokenCtx.op ?? "read",
+      { ownerLevel: (c.tokenCtx.op ?? "read") === "write" ? "authority" : "reach" },
+    ).catch((diagnosticFailure) => { observeCaughtError(diagnosticFailure, "platform/engine/modules/github/github.token"); return false; });
+    if (ok) allowed.push(name);
+  }
+  if (allowed.length < candidates.length) {
+    errorDiagnostics.warn("platform/engine/modules/github/github.token",
+      `[github.token] submodule token expansion: ${candidates.length - allowed.length} of ` +
+        `${candidates.length} extra repo(s) under owner=${owner} not authorized for this caller; dropped`,
+    );
+  }
+  return allowed.length ? allowed : undefined;
 }
 
 async function readProjectToken(projectId: string): Promise<string | null> {
