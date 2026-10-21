@@ -229,3 +229,55 @@ describe("Docker service replacement ordering", () => {
     expect(docker.createContainer).not.toHaveBeenCalled();
   });
 });
+
+describe("Docker service cutover with shared read/write mounts", () => {
+  async function run(optIn: string | undefined) {
+    const prevEnv = process.env.OPENSHIP_CUTOVER_SHARED_VOLUMES;
+    if (optIn === undefined) delete process.env.OPENSHIP_CUTOVER_SHARED_VOLUMES;
+    else process.env.OPENSHIP_CUTOVER_SHARED_VOLUMES = optIn;
+    const stop = vi.fn(async () => undefined);
+    const remove = vi.fn(async () => undefined);
+    const inspect = vi.fn(async () => ({
+      Id: "incumbent-id",
+      State: { Running: true, Status: "running" },
+      Mounts: [{ RW: true, Destination: "/data" }],
+      Config: { StopTimeout: 10 },
+    }));
+    const docker = {
+      getImage: vi.fn(() => ({ inspect: vi.fn(async () => ({ Config: { Labels: {} } })) })),
+      getContainer: vi.fn(() => ({ stop, remove, inspect })),
+      listContainers: vi.fn(async () => []),
+      createContainer: vi.fn().mockRejectedValue(new Error("payload reached")),
+    };
+    const runtime = await DockerRuntime.create({ dockerSocketPath: "/tmp/openship-test-absent.sock" });
+    (runtime as unknown as { _docker: unknown })._docker = docker;
+    try {
+      await expect(
+        runtime.deployServiceWorkload(GROUP, { ...CONFIG, forcePull: false, volumes: ["data:/data"] }),
+      ).rejects.toThrow("payload reached");
+    } finally {
+      if (prevEnv === undefined) delete process.env.OPENSHIP_CUTOVER_SHARED_VOLUMES;
+      else process.env.OPENSHIP_CUTOVER_SHARED_VOLUMES = prevEnv;
+    }
+    const createArgs = docker.createContainer.mock.calls[0]?.[0] as { name?: string } | undefined;
+    return { stop, createName: createArgs?.name };
+  }
+
+  it("keeps the stop-then-create path by default", async () => {
+    const { stop, createName } = await run(undefined);
+    expect(stop).toHaveBeenCalled();
+    expect(createName).toBe("openship-demo-api");
+  });
+
+  it("keeps the stop-then-create path for a service that is not listed", async () => {
+    const { stop, createName } = await run("demo/worker:/data other/api:/data");
+    expect(stop).toHaveBeenCalled();
+    expect(createName).toBe("openship-demo-api");
+  });
+
+  it("starts the replacement beside the incumbent when the mount is opted in", async () => {
+    const { stop, createName } = await run("demo/api:/data");
+    expect(stop).not.toHaveBeenCalled();
+    expect(createName).toBe("openship-cutover-dep1-api");
+  });
+});
