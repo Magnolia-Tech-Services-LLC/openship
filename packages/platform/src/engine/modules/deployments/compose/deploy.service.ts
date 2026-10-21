@@ -3208,7 +3208,17 @@ async function deployComposeServicesUnlocked(
             if (result.routeWarnings?.length) composeRouteWarnings.push(...result.routeWarnings);
             return { containerId: result.containerId };
           },
-          deactivate: (containerId) => runtime.destroy(containerId),
+          // A runtime with `serviceCutover` replaces the incumbent inside
+          // deployServiceWorkload (overlap when safe, stop-then-create otherwise),
+          // so the pipeline can run in overlap order instead of destroying the
+          // running service before the replacement exists. Loopback-port routing
+          // pins a host port that cannot be bound twice, so it keeps the default.
+          canOverlap: !usesHostLoopback && runtime.supports("serviceCutover"),
+          deactivate: async (containerId) => {
+            const retired = serviceResult?.retiredContainerIds ?? [];
+            if (retired.some((id) => id === containerId || id.startsWith(containerId))) return;
+            await runtime.destroy(containerId);
+          },
           resolveTargetUrl:
             proxyRoutes.length > 0
               ? async (containerId, port) => {

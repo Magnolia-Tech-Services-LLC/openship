@@ -164,7 +164,15 @@ export type RuntimeCapability =
    * — see modules/monitoring/container-events.ts. Docker implements it;
    * Cloud/Bare have no event feed.
    */
-  | "containerEvents";
+  | "containerEvents"
+  /**
+   * `deployServiceWorkload` decides per service between an overlap cutover (start
+   * the replacement beside the running incumbent, then retire it) and the
+   * stop-then-create replace, and retires the incumbent itself. Callers may run
+   * the deploy pipeline in overlap order and must not destroy a container listed
+   * in `MultiServiceDeployResult.retiredContainerIds` a second time.
+   */
+  | "serviceCutover";
 
 // ─── Events ──────────────────────────────────────────────────────────────────
 
@@ -654,6 +662,11 @@ export interface MultiServiceDeployResult {
    * locally-built image with no registry digest).
    */
   imageDigest?: string;
+  /**
+   * Containers this call already stopped and removed while replacing the
+   * service (see the `serviceCutover` capability).
+   */
+  retiredContainerIds?: string[];
 }
 
 export interface MultiServiceRuntimeAdapter extends RuntimeAdapter {
