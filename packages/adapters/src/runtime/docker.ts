@@ -65,6 +65,7 @@ import type {
   ProvisionLock,
 } from "../types";
 import type { PortProbeExecutor } from "../system/port-listen";
+import { hasHostPortBindings, newcomerName, prevName, rwVolumeDest, stableName } from "./cutover";
 import { PassThrough, Writable, type Readable } from "node:stream";
 import { relative, sep } from "node:path";
 import { resolveDockerBuildArgs } from "./docker-build-args";
@@ -6087,13 +6088,157 @@ export class DockerRuntime implements RuntimeAdapter {
    * service containers join the project network with their service name as hostname.
    * External port bindings are only created for services that explicitly expose ports.
    */
+  private async waitWorkloadHealthy(
+    containerId: string,
+    port: number,
+    log: LogCallback,
+  ): Promise<void> {
+    const c = this.docker.getContainer(containerId);
+    const deadline = Date.now() + 180_000;
+    while (Date.now() < deadline) {
+      const data = await c.inspect();
+      if (!data.State?.Running) {
+        throw new Error("newcomer exited during health wait");
+      }
+      const health = data.State.Health?.Status;
+      if (health === "healthy") {
+        log({ timestamp: new Date().toISOString(), message: "cutover: docker health=healthy\n", level: "info" });
+        return;
+      }
+      if (health === "unhealthy") throw new Error("newcomer unhealthy");
+      const ok = await this.probeLoopbackHttp(containerId, port);
+      if (ok) {
+        log({ timestamp: new Date().toISOString(), message: `cutover: loopback :${port} accepted traffic\n`, level: "info" });
+        return;
+      }
+      const upMs = Date.now() - (new Date(data.State.StartedAt).getTime() || Date.now());
+      if (upMs > 20_000) {
+        log({ timestamp: new Date().toISOString(), message: "cutover: no http probe in image; incumbent-safe after 20s running\n", level: "info" });
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+    throw new Error(`newcomer not healthy within 180s on :${port}`);
+  }
+  private async probeLoopbackHttp(containerId: string, port: number): Promise<boolean> {
+    const c = this.docker.getContainer(containerId);
+    const script =
+      `port=${port}; code=000; ` +
+      `if command -v curl >/dev/null 2>&1; then ` +
+      `code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 http://127.0.0.1:$port/ || echo 000); ` +
+      `elif command -v wget >/dev/null 2>&1; then ` +
+      `wget -q -T 2 -O /dev/null http://127.0.0.1:$port/ && code=200 || code=000; ` +
+      `fi; case $code in 2*|3*|401|403|404) exit 0;; esac; exit 1`;
+    try {
+      const exec = await c.exec({ Cmd: ["sh", "-c", script], AttachStdout: true, AttachStderr: true });
+      await new Promise<void>((resolve, reject) => {
+        exec.start({ hijack: true }, (err: Error | null, stream?: NodeJS.ReadableStream) => {
+          if (err || !stream) {
+            reject(err ?? new Error("exec start failed"));
+            return;
+          }
+          stream.on("end", () => resolve());
+          stream.on("error", reject);
+          stream.resume();
+        });
+      });
+      const info = await exec.inspect();
+      return info.ExitCode === 0;
+    } catch {
+      return false;
+    }
+  }
+  private async swapMagnoliaAliases(oldId: string, newId: string, log: LogCallback): Promise<void> {
+    const oldInfo = await this.docker.getContainer(oldId).inspect();
+    const mag = oldInfo.NetworkSettings?.Networks?.magnolia;
+    if (!mag) {
+      log({ timestamp: new Date().toISOString(), message: "cutover: incumbent not on magnolia; skipping alias swap\n", level: "warn" });
+      return;
+    }
+    const skip = new Set(
+      [oldInfo.Name?.replace(/^\//, ""), oldInfo.Id, oldInfo.Id?.slice(0, 12)].filter(Boolean) as string[],
+    );
+    const aliases = (mag.Aliases ?? []).filter((a: string) => a && !skip.has(a));
+    const network = this.docker.getNetwork("magnolia");
+    if (aliases.length > 0) {
+      try {
+        await network.connect({ Container: newId, EndpointConfig: { Aliases: aliases } });
+      } catch (err) {
+        const msg = (err as { message?: string })?.message ?? "";
+        if (!/already exists|already connected/i.test(msg)) throw err;
+      }
+    } else {
+      await network.connect({ Container: newId });
+    }
+    try {
+      await network.disconnect({ Container: oldId });
+    } catch (err) {
+      const msg = (err as { message?: string })?.message ?? "";
+      if (!/not connected|not found/i.test(msg)) throw err;
+    }
+    log({ timestamp: new Date().toISOString(), message: `cutover: magnolia aliases ${aliases.join(",") || "(none)"} moved\n`, level: "info" });
+  }
   async deployServiceWorkload(
     group: MultiServiceGroupHandle,
     config: MultiServiceDeployConfig,
     onLog?: LogCallback,
   ): Promise<MultiServiceDeployResult> {
     const log = onLog ?? (() => {});
-    const containerName = `openship-${config.slug}-${config.serviceName}`;
+    const stable = stableName({ slug: config.slug, serviceName: config.serviceName });
+    const cutoverCfg = {
+      ports: config.ports ?? [],
+      volumes: config.volumes ?? [],
+      publicPort: config.publicPort,
+      slug: config.slug,
+      serviceName: config.serviceName,
+      deploymentId: config.deploymentId,
+    };
+    let overlap = false;
+    let oldId: string | undefined;
+    try {
+      const incumbentRef = (config as { previousContainerId?: string }).previousContainerId || stable;
+      let oldInfo: Dockerode.ContainerInspectInfo;
+      try {
+        oldInfo = await this.docker.getContainer(incumbentRef).inspect();
+      } catch {
+        const listed = await this.docker.listContainers({ all: true });
+        const hit = listed.find((c) => {
+          const names = (c.Names ?? []).map((n: string) => n.replace(/^\//, ""));
+          return names.includes(stable) || c.Id === incumbentRef || c.Id.startsWith(incumbentRef);
+        });
+        if (!hit) throw new Error("incumbent not in docker ps");
+        oldInfo = await this.docker.getContainer(hit.Id).inspect();
+      }
+      const running = oldInfo.State?.Running === true || oldInfo.State?.Status === "running";
+      if (running) {
+        oldId = oldInfo.Id;
+        const oldDests = new Set(
+          (oldInfo.Mounts ?? [])
+            .filter((m: { RW?: boolean; Destination?: string }) => m.RW && m.Destination)
+            .map((m: { Destination: string }) => m.Destination),
+        );
+        const newDests = cutoverCfg.volumes.map(rwVolumeDest).filter((d): d is string => !!d);
+        const volClash = newDests.some((d) => oldDests.has(d));
+        overlap = !hasHostPortBindings(cutoverCfg.ports) && !volClash;
+      }
+      console.warn("[cutover] ref=" + incumbentRef + " stable=" + stable + " running=" + String(running) + " overlap=" + String(overlap) + " volClashPorts=" + JSON.stringify(cutoverCfg.ports));
+    } catch (inspectErr) {
+      console.warn("[cutover] inspect failed for " + stable + ": " + inspectErr);
+    }
+    const containerName = overlap ? newcomerName(cutoverCfg) : stable;
+    if (overlap) {
+      log({
+        timestamp: new Date().toISOString(),
+        message: `cutover overlap: keeping ${stable} until ${containerName} is healthy\n`,
+        level: "info",
+      });
+    } else {
+      log({
+        timestamp: new Date().toISOString(),
+        message: `cutover replace: ${stable}\n`,
+        level: "info",
+      });
+    }
 
     // Resolve and validate the complete create payload before any irreversible
     // action. A malformed later port/volume/health setting must not be discovered
@@ -6176,13 +6321,21 @@ export class DockerRuntime implements RuntimeAdapter {
 
     // Flush the existing service before removing it, using Docker's normal
     // shutdown semantics even without an explicit Compose grace period.
-    try {
-      const existing = this.docker.getContainer(containerName);
-      await this.assertContainerAccess(containerName);
-      await gracefulStopBeforeRemoval(existing);
-      await existing.remove({ force: true });
-    } catch (error) {
-      if (!isDockerNotFoundError(error)) throw error;
+    if (!overlap) {
+      try {
+        const existing = this.docker.getContainer(stable);
+        await this.assertContainerAccess(stable);
+        await gracefulStopBeforeRemoval(existing);
+        await existing.remove({ force: true });
+      } catch (error) {
+        if (!isDockerNotFoundError(error)) throw error;
+      }
+    } else {
+      try {
+        await this.docker.getContainer(containerName).remove({ force: true });
+      } catch {
+        /* leftover newcomer from a failed prior cutover */
+      }
     }
 
     // Environment variables. Inject PORT=<service port> (like the single-app
@@ -6300,7 +6453,43 @@ export class DockerRuntime implements RuntimeAdapter {
       }
       throw startErr;
     }
-
+    if (overlap && oldId) {
+      try {
+        await this.waitWorkloadHealthy(container.id, config.publicPort ?? 3000, log);
+        await this.swapMagnoliaAliases(oldId, container.id, log);
+        const prev = prevName(cutoverCfg);
+        try {
+          await this.docker.getContainer(prev).remove({ force: true });
+        } catch {
+          /* no leftover prev */
+        }
+        await this.docker.getContainer(oldId).rename({ name: prev });
+        await container.rename({ name: stable });
+        try {
+          await gracefulStopBeforeRemoval(this.docker.getContainer(prev));
+          await this.docker.getContainer(prev).remove({ force: true });
+        } catch {
+          /* prev already gone */
+        }
+        log({
+          timestamp: new Date().toISOString(),
+          message: `cutover overlap complete: ${stable} is the new origin\n`,
+          level: "info",
+        });
+      } catch (cutErr) {
+        log({
+          timestamp: new Date().toISOString(),
+          message: `cutover overlap failed; leaving incumbent ${stable}: ${cutErr}\n`,
+          level: "error",
+        });
+        try {
+          await container.remove({ force: true });
+        } catch (diagnosticFailure) {
+          observeCaughtError(diagnosticFailure, "adapters/runtime/docker");
+        }
+        throw cutErr;
+      }
+    }
     // Get container IP on the project network
     const data = await container.inspect();
     const { ip, hostPort, hostPortByContainerPort } = extractNetworkInfo(data);
