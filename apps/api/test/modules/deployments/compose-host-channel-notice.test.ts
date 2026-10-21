@@ -434,6 +434,54 @@ describe("compose deploy — host channel unavailable", () => {
     }));
   });
 
+  it("without serviceCutover, destroys the previous container before starting the replacement", async () => {
+    const f = imageRefreshFixture();
+    f.pull.mockImplementation(async ref => {
+      if (ref === f.apiRef) f.images.set(ref, f.metadata(ref, f.nextId));
+    });
+    const result = await f.run();
+    expect(result.status).toBe("ready");
+    expect(f.runtime.destroy).toHaveBeenCalledWith("old-api");
+    expect(vi.mocked(f.runtime.destroy).mock.invocationCallOrder[0]).toBeLessThan(
+      f.activate.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it("with serviceCutover, starts the replacement while the previous container still runs", async () => {
+    const f = imageRefreshFixture();
+    const supports = f.runtime.supports.bind(f.runtime);
+    (f.runtime as unknown as { supports: (cap: string) => boolean }).supports = (cap: string) =>
+      cap === "serviceCutover" || supports(cap as never);
+    f.pull.mockImplementation(async ref => {
+      if (ref === f.apiRef) f.images.set(ref, f.metadata(ref, f.nextId));
+    });
+    const result = await f.run();
+    expect(result.status).toBe("ready");
+    expect(f.activate).toHaveBeenCalledOnce();
+    // The runtime did not report retiring it, so the pipeline retires it afterwards.
+    expect(f.runtime.destroy).toHaveBeenCalledWith("old-api");
+    expect(f.activate.mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(f.runtime.destroy).mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it("with serviceCutover, does not destroy a container the runtime already retired", async () => {
+    const f = imageRefreshFixture();
+    const supports = f.runtime.supports.bind(f.runtime);
+    (f.runtime as unknown as { supports: (cap: string) => boolean }).supports = (cap: string) =>
+      cap === "serviceCutover" || supports(cap as never);
+    f.activate.mockImplementation(async (_group: unknown, config: { serviceName: string; image: string }) => ({
+      status: "running", containerId: `new-${config.serviceName}`, ip: "172.18.0.3",
+      retiredContainerIds: [`old-${config.serviceName}-full-id`],
+    }));
+    f.pull.mockImplementation(async ref => {
+      if (ref === f.apiRef) f.images.set(ref, f.metadata(ref, f.nextId));
+    });
+    const result = await f.run();
+    expect(result.status).toBe("ready");
+    expect(f.runtime.destroy).not.toHaveBeenCalledWith("old-api");
+  });
+
   it("aborts the whole cohort when a later registry pull fails, preserving every old service", async () => {
     const f = imageRefreshFixture();
     f.pull.mockImplementation(async ref => {

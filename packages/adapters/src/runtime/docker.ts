@@ -1207,6 +1207,7 @@ export class DockerRuntime implements RuntimeAdapter {
     "hostContainerQuery",
     "stabilityProbe",
     "containerEvents",
+    "serviceCutover",
     // Docker implements `inContainerExecutor` but had never DECLARED the capability.
     // Nothing gated on it (every caller tested for the method), so the omission was
     // invisible — but it meant the honest answer to supports("inContainerExec") was
@@ -6295,6 +6296,8 @@ export class DockerRuntime implements RuntimeAdapter {
     };
     let overlap = false;
     let oldId: string | undefined;
+    let incumbentId: string | undefined;
+    const retiredContainerIds: string[] = [];
     try {
       const incumbentRef = (config as { previousContainerId?: string }).previousContainerId || stable;
       let oldInfo: Dockerode.ContainerInspectInfo;
@@ -6309,6 +6312,7 @@ export class DockerRuntime implements RuntimeAdapter {
         if (!hit) throw new Error("incumbent not found");
         oldInfo = await this.docker.getContainer(hit.Id).inspect();
       }
+      incumbentId = oldInfo.Id;
       const running = oldInfo.State?.Running === true || oldInfo.State?.Status === "running";
       const decision = decideCutover({
         incumbentRunning: running,
@@ -6361,6 +6365,7 @@ export class DockerRuntime implements RuntimeAdapter {
         await this.assertContainerAccess(stable);
         await gracefulStopBeforeRemoval(existing);
         await existing.remove({ force: true });
+        if (incumbentId) retiredContainerIds.push(incumbentId);
       } catch (error) {
         if (!isDockerNotFoundError(error)) throw error;
       }
@@ -6505,6 +6510,7 @@ export class DockerRuntime implements RuntimeAdapter {
         } catch {
           /* prev already gone */
         }
+        retiredContainerIds.push(oldId);
         log({
           timestamp: new Date().toISOString(),
           message: `cutover overlap complete: ${stable} is the new origin\n`,
@@ -6546,6 +6552,7 @@ export class DockerRuntime implements RuntimeAdapter {
       hostPort,
       ...(hostPortByContainerPort ? { hostPortByContainerPort } : {}),
       imageDigest,
+      ...(retiredContainerIds.length ? { retiredContainerIds } : {}),
     };
   }
 
