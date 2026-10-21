@@ -65,7 +65,15 @@ import type {
   ProvisionLock,
 } from "../types";
 import type { PortProbeExecutor } from "../system/port-listen";
-import { hasHostPortBindings, newcomerName, prevName, rwVolumeDest, stableName } from "./cutover";
+import {
+  CUTOVER_SHARED_VOLUMES_ENV,
+  decideCutover,
+  networksToCarry,
+  newcomerName,
+  parseSharedVolumeOptIn,
+  prevName,
+  stableName,
+} from "./cutover";
 import { PassThrough, Writable, type Readable } from "node:stream";
 import { relative, sep } from "node:path";
 import { resolveDockerBuildArgs } from "./docker-build-args";
@@ -6148,35 +6156,45 @@ export class DockerRuntime implements RuntimeAdapter {
       return false;
     }
   }
-  private async swapMagnoliaAliases(oldId: string, newId: string, log: LogCallback): Promise<void> {
+  /**
+   * Attach the replacement to every network the incumbent is on that it is not
+   * (for example an operator-managed shared network), with the same aliases,
+   * then detach the incumbent from those networks so names resolve only to the
+   * replacement.
+   */
+  private async carryExtraNetworks(oldId: string, newId: string, log: LogCallback): Promise<void> {
     const oldInfo = await this.docker.getContainer(oldId).inspect();
-    const mag = oldInfo.NetworkSettings?.Networks?.magnolia;
-    if (!mag) {
-      log({ timestamp: new Date().toISOString(), message: "cutover: incumbent not on magnolia; skipping alias swap\n", level: "warn" });
-      return;
-    }
-    const skip = new Set(
-      [oldInfo.Name?.replace(/^\//, ""), oldInfo.Id, oldInfo.Id?.slice(0, 12)].filter(Boolean) as string[],
-    );
-    const aliases = (mag.Aliases ?? []).filter((a: string) => a && !skip.has(a));
-    const network = this.docker.getNetwork("magnolia");
-    if (aliases.length > 0) {
+    const newInfo = await this.docker.getContainer(newId).inspect();
+    const carry = networksToCarry({
+      incumbentNetworks: (oldInfo.NetworkSettings?.Networks ?? {}) as Record<string, { Aliases?: string[] | null }>,
+      newcomerNetworks: Object.keys(newInfo.NetworkSettings?.Networks ?? {}),
+      incumbentIdentity: [oldInfo.Name, oldInfo.Id, oldInfo.Id?.slice(0, 12)],
+    });
+    // Connect everything first, so a failure leaves the incumbent fully attached.
+    for (const { network: name, aliases } of carry) {
       try {
-        await network.connect({ Container: newId, EndpointConfig: { Aliases: aliases } });
+        await this.docker.getNetwork(name).connect({
+          Container: newId,
+          ...(aliases.length > 0 ? { EndpointConfig: { Aliases: aliases } } : {}),
+        });
       } catch (err) {
         const msg = (err as { message?: string })?.message ?? "";
         if (!/already exists|already connected/i.test(msg)) throw err;
       }
-    } else {
-      await network.connect({ Container: newId });
     }
-    try {
-      await network.disconnect({ Container: oldId });
-    } catch (err) {
-      const msg = (err as { message?: string })?.message ?? "";
-      if (!/not connected|not found/i.test(msg)) throw err;
+    for (const { network: name, aliases } of carry) {
+      try {
+        await this.docker.getNetwork(name).disconnect({ Container: oldId });
+      } catch (err) {
+        const msg = (err as { message?: string })?.message ?? "";
+        if (!/not connected|not found/i.test(msg)) throw err;
+      }
+      log({
+        timestamp: new Date().toISOString(),
+        message: `cutover: moved network ${name} (aliases: ${aliases.join(",") || "none"})\n`,
+        level: "info",
+      });
     }
-    log({ timestamp: new Date().toISOString(), message: `cutover: magnolia aliases ${aliases.join(",") || "(none)"} moved\n`, level: "info" });
   }
   async deployServiceWorkload(
     group: MultiServiceGroupHandle,
@@ -6264,8 +6282,8 @@ export class DockerRuntime implements RuntimeAdapter {
       if (start) cmd = ["sh", "-c", start];
     }
 
-    // Magnolia cutover: inspect the incumbent only AFTER the replacement image is
-    // acquired/validated above, so a failed pull never touches the live service.
+    // Overlap cutover: inspect the incumbent only AFTER the replacement image is
+    // acquired and validated above, so a failed pull never touches the live service.
     const stable = stableName({ slug: config.slug, serviceName: config.serviceName });
     const cutoverCfg = {
       ports: config.ports ?? [],
@@ -6288,24 +6306,37 @@ export class DockerRuntime implements RuntimeAdapter {
           const names = (c.Names ?? []).map((n: string) => n.replace(/^\//, ""));
           return names.includes(stable) || c.Id === incumbentRef || c.Id.startsWith(incumbentRef);
         });
-        if (!hit) throw new Error("incumbent not in docker ps");
+        if (!hit) throw new Error("incumbent not found");
         oldInfo = await this.docker.getContainer(hit.Id).inspect();
       }
       const running = oldInfo.State?.Running === true || oldInfo.State?.Status === "running";
-      if (running) {
+      const decision = decideCutover({
+        incumbentRunning: running,
+        incumbentRwDests: (oldInfo.Mounts ?? [])
+          .filter((m: { RW?: boolean; Destination?: string }) => m.RW && m.Destination)
+          .map((m: { Destination: string }) => m.Destination),
+        ports: cutoverCfg.ports,
+        volumes: cutoverCfg.volumes,
+        slug: cutoverCfg.slug,
+        serviceName: cutoverCfg.serviceName,
+        sharedOptIn: parseSharedVolumeOptIn(process.env[CUTOVER_SHARED_VOLUMES_ENV]),
+      });
+      if (decision.mode === "overlap") {
+        overlap = true;
         oldId = oldInfo.Id;
-        const oldDests = new Set(
-          (oldInfo.Mounts ?? [])
-            .filter((m: { RW?: boolean; Destination?: string }) => m.RW && m.Destination)
-            .map((m: { Destination: string }) => m.Destination),
-        );
-        const newDests = cutoverCfg.volumes.map(rwVolumeDest).filter((d): d is string => !!d);
-        const volClash = newDests.some((d) => oldDests.has(d));
-        overlap = !hasHostPortBindings(cutoverCfg.ports) && !volClash;
+      } else if (decision.reason !== "no-incumbent") {
+        log({
+          timestamp: new Date().toISOString(),
+          message:
+            `cutover: replace path (${decision.reason}` +
+            (decision.clashes?.length ? `: ${decision.clashes.join(",")}` : "") +
+            ")\n",
+          level: "info",
+        });
       }
-      console.warn("[cutover] ref=" + incumbentRef + " stable=" + stable + " running=" + String(running) + " overlap=" + String(overlap) + " volClashPorts=" + JSON.stringify(cutoverCfg.ports));
-    } catch (inspectErr) {
-      console.warn("[cutover] inspect failed for " + stable + ": " + inspectErr);
+    } catch {
+      // No incumbent (first deploy, or it was removed): the replace path below
+      // simply creates the container.
     }
     const containerName = overlap ? newcomerName(cutoverCfg) : stable;
     if (overlap) {
@@ -6459,7 +6490,7 @@ export class DockerRuntime implements RuntimeAdapter {
     if (overlap && oldId) {
       try {
         await this.waitWorkloadHealthy(container.id, config.publicPort ?? 3000, log);
-        await this.swapMagnoliaAliases(oldId, container.id, log);
+        await this.carryExtraNetworks(oldId, container.id, log);
         const prev = prevName(cutoverCfg);
         try {
           await this.docker.getContainer(prev).remove({ force: true });
