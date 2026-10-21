@@ -6184,61 +6184,6 @@ export class DockerRuntime implements RuntimeAdapter {
     onLog?: LogCallback,
   ): Promise<MultiServiceDeployResult> {
     const log = onLog ?? (() => {});
-    const stable = stableName({ slug: config.slug, serviceName: config.serviceName });
-    const cutoverCfg = {
-      ports: config.ports ?? [],
-      volumes: config.volumes ?? [],
-      publicPort: config.publicPort,
-      slug: config.slug,
-      serviceName: config.serviceName,
-      deploymentId: config.deploymentId,
-    };
-    let overlap = false;
-    let oldId: string | undefined;
-    try {
-      const incumbentRef = (config as { previousContainerId?: string }).previousContainerId || stable;
-      let oldInfo: Dockerode.ContainerInspectInfo;
-      try {
-        oldInfo = await this.docker.getContainer(incumbentRef).inspect();
-      } catch {
-        const listed = await this.docker.listContainers({ all: true });
-        const hit = listed.find((c) => {
-          const names = (c.Names ?? []).map((n: string) => n.replace(/^\//, ""));
-          return names.includes(stable) || c.Id === incumbentRef || c.Id.startsWith(incumbentRef);
-        });
-        if (!hit) throw new Error("incumbent not in docker ps");
-        oldInfo = await this.docker.getContainer(hit.Id).inspect();
-      }
-      const running = oldInfo.State?.Running === true || oldInfo.State?.Status === "running";
-      if (running) {
-        oldId = oldInfo.Id;
-        const oldDests = new Set(
-          (oldInfo.Mounts ?? [])
-            .filter((m: { RW?: boolean; Destination?: string }) => m.RW && m.Destination)
-            .map((m: { Destination: string }) => m.Destination),
-        );
-        const newDests = cutoverCfg.volumes.map(rwVolumeDest).filter((d): d is string => !!d);
-        const volClash = newDests.some((d) => oldDests.has(d));
-        overlap = !hasHostPortBindings(cutoverCfg.ports) && !volClash;
-      }
-      console.warn("[cutover] ref=" + incumbentRef + " stable=" + stable + " running=" + String(running) + " overlap=" + String(overlap) + " volClashPorts=" + JSON.stringify(cutoverCfg.ports));
-    } catch (inspectErr) {
-      console.warn("[cutover] inspect failed for " + stable + ": " + inspectErr);
-    }
-    const containerName = overlap ? newcomerName(cutoverCfg) : stable;
-    if (overlap) {
-      log({
-        timestamp: new Date().toISOString(),
-        message: `cutover overlap: keeping ${stable} until ${containerName} is healthy\n`,
-        level: "info",
-      });
-    } else {
-      log({
-        timestamp: new Date().toISOString(),
-        message: `cutover replace: ${stable}\n`,
-        level: "info",
-      });
-    }
 
     // Resolve and validate the complete create payload before any irreversible
     // action. A malformed later port/volume/health setting must not be discovered
@@ -6317,6 +6262,64 @@ export class DockerRuntime implements RuntimeAdapter {
     if (!config.advanced?.entrypoint && cmd?.length === 3 && cmd[0] === "sh" && cmd[1] === "-c") {
       const start = imageStartCommand((await this.inspectDeploymentImage(config.image)).Config?.Labels, cmd[2]);
       if (start) cmd = ["sh", "-c", start];
+    }
+
+    // Magnolia cutover: inspect the incumbent only AFTER the replacement image is
+    // acquired/validated above, so a failed pull never touches the live service.
+    const stable = stableName({ slug: config.slug, serviceName: config.serviceName });
+    const cutoverCfg = {
+      ports: config.ports ?? [],
+      volumes: config.volumes ?? [],
+      publicPort: config.publicPort,
+      slug: config.slug,
+      serviceName: config.serviceName,
+      deploymentId: config.deploymentId,
+    };
+    let overlap = false;
+    let oldId: string | undefined;
+    try {
+      const incumbentRef = (config as { previousContainerId?: string }).previousContainerId || stable;
+      let oldInfo: Dockerode.ContainerInspectInfo;
+      try {
+        oldInfo = await this.docker.getContainer(incumbentRef).inspect();
+      } catch {
+        const listed = await this.docker.listContainers({ all: true });
+        const hit = listed.find((c) => {
+          const names = (c.Names ?? []).map((n: string) => n.replace(/^\//, ""));
+          return names.includes(stable) || c.Id === incumbentRef || c.Id.startsWith(incumbentRef);
+        });
+        if (!hit) throw new Error("incumbent not in docker ps");
+        oldInfo = await this.docker.getContainer(hit.Id).inspect();
+      }
+      const running = oldInfo.State?.Running === true || oldInfo.State?.Status === "running";
+      if (running) {
+        oldId = oldInfo.Id;
+        const oldDests = new Set(
+          (oldInfo.Mounts ?? [])
+            .filter((m: { RW?: boolean; Destination?: string }) => m.RW && m.Destination)
+            .map((m: { Destination: string }) => m.Destination),
+        );
+        const newDests = cutoverCfg.volumes.map(rwVolumeDest).filter((d): d is string => !!d);
+        const volClash = newDests.some((d) => oldDests.has(d));
+        overlap = !hasHostPortBindings(cutoverCfg.ports) && !volClash;
+      }
+      console.warn("[cutover] ref=" + incumbentRef + " stable=" + stable + " running=" + String(running) + " overlap=" + String(overlap) + " volClashPorts=" + JSON.stringify(cutoverCfg.ports));
+    } catch (inspectErr) {
+      console.warn("[cutover] inspect failed for " + stable + ": " + inspectErr);
+    }
+    const containerName = overlap ? newcomerName(cutoverCfg) : stable;
+    if (overlap) {
+      log({
+        timestamp: new Date().toISOString(),
+        message: `cutover overlap: keeping ${stable} until ${containerName} is healthy\n`,
+        level: "info",
+      });
+    } else {
+      log({
+        timestamp: new Date().toISOString(),
+        message: `cutover replace: ${stable}\n`,
+        level: "info",
+      });
     }
 
     // Flush the existing service before removing it, using Docker's normal
