@@ -1141,7 +1141,7 @@ export class DockerRuntime implements RuntimeAdapter {
   /** An exact journal reference is still subject to the daemon's ownership labels. */
   async findOwnedDeploymentContainer(
     reference: string,
-    owner: { projectId: string; deploymentId: string; role?: string },
+    owner: { projectId: string; deploymentId: string; role?: string; service?: string },
   ): Promise<string | null> {
     let info: Dockerode.ContainerInspectInfo;
     try {
@@ -1154,6 +1154,7 @@ export class DockerRuntime implements RuntimeAdapter {
     if (
       labels[OPENSHIP_LABEL.project] !== owner.projectId ||
       labels[OPENSHIP_LABEL.deployment] !== owner.deploymentId ||
+      (owner.service !== undefined && labels[OPENSHIP_LABEL.service] !== owner.service) ||
       (owner.role ? labels[OPENSHIP_LABEL.role] !== owner.role : !!labels[OPENSHIP_LABEL.role])
     ) {
       throw new Error(
@@ -6265,6 +6266,7 @@ export class DockerRuntime implements RuntimeAdapter {
     const container = await this.docker.createContainer({
       name: containerName,
       Image: config.image,
+      abortSignal: config.signal,
       Cmd: cmd,
       // Entrypoint (#575). SPREAD rather than assigned, because `undefined` and `[]`
       // must reach Docker differently: absent leaves the image's own ENTRYPOINT
@@ -6319,11 +6321,39 @@ export class DockerRuntime implements RuntimeAdapter {
             },
           }
         : {}),
+    }).catch(async error => {
+      // Docker may have accepted create before its response was lost. Recover
+      // the exact ID through the name reserved for this attempt, checking all
+      // ownership labels before handing it to the pipeline's failure cleanup.
+      try {
+        const id = await withTimeout(
+          this.findOwnedDeploymentContainer(containerName, {
+            projectId: config.projectId,
+            deploymentId: config.deploymentId,
+            service: config.serviceName,
+          }),
+          5_000,
+          "Could not verify the replacement after Docker create failed",
+        );
+        if (id) {
+          if (config.onContainerCreated) config.onContainerCreated(id);
+          else await this.destroy(id);
+        }
+      } catch (recoveryError) {
+        observeCaughtError(recoveryError, "adapters/runtime/docker");
+        log({
+          timestamp: new Date().toISOString(),
+          level: "warn",
+          message: `Could not confirm replacement cleanup: ${safeErrorMessage(recoveryError)}\n`,
+        });
+      }
+      throw error;
     });
 
     config.onContainerCreated?.(container.id);
     try {
-      await container.start();
+      config.signal?.throwIfAborted();
+      await container.start({ abortSignal: config.signal });
     } catch (startErr) {
       // The shared pipeline owns cleanup when it has the exact ID; it must
       // stop this replacement before restarting the retained release.

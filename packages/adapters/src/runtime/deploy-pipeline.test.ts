@@ -4,6 +4,7 @@ import {
   type DeployEnvironment,
   type DeployPipelineInput,
   type DeployRouting,
+  type DeferredDeployment,
 } from "./deploy-pipeline";
 import type { BuildLogger } from "./build-pipeline";
 import type { DeployConfig } from "../types";
@@ -376,9 +377,80 @@ describe("runDeployPipeline cutover ordering", () => {
   });
 });
 
-// Domains are OPTIONAL — routing runs after the container is up + healthy, so a
-// routing failure must never flip the deploy to "failed". It's collected as a
-// per-domain warning on a still-"ready" result.
+describe("deferred Compose readiness", () => {
+  function retainedEnv(events: string[], over: Partial<DeployEnvironment> = {}) {
+    return recordingEnv(events, {
+      deactivateRetaining: async () => { events.push("stop-old"); },
+      retireRetainedPrevious: async () => { events.push("retire-old"); },
+      stopActivated: async () => { events.push("stop-new"); },
+      reactivatePrevious: async () => { events.push("restore-old"); },
+      ...over,
+    });
+  }
+
+  it("retains the predecessor until the stack passes, and commits once", async () => {
+    const events: string[] = [];
+    let activation!: DeferredDeployment;
+    const result = await runDeployPipeline(retainedEnv(events), makeInput({
+      deferCompletion: value => { activation = value; },
+    }), fakeLogger());
+    expect(result.status).toBe("ready");
+    expect(events).toEqual(["stop-old", "activate", "route"]);
+    await expect(activation.complete()).resolves.toMatchObject({ status: "ready" });
+    await activation.complete();
+    expect(events).toEqual(["stop-old", "activate", "route", "retire-old"]);
+  });
+
+  it("stops a failed replacement before restoring the predecessor and its routes", async () => {
+    const events: string[] = [];
+    let activation!: DeferredDeployment;
+    await runDeployPipeline(retainedEnv(events, {
+      resolveRoute: async id => ({ targetUrl: `http://${id}:3000` }),
+    }), makeInput({
+      domains: [{ hostname: "app.example.com", tls: false, targetPort: 3000 }],
+      routing: { registerRoute: async route => { events.push(`route:${route.targetUrl}`); } },
+      deferCompletion: value => { activation = value; },
+    }), fakeLogger());
+    const failed = await activation.rollback(new Error("readiness failed"));
+    expect(failed).toMatchObject({ status: "failed", restoredPreviousContainerId: "old" });
+    expect(events).toEqual(["stop-old", "activate", "route:http://new-container:3000",
+      "stop-new", "restore-old", "route:http://old:3000"]);
+    expect(await activation.complete()).toBe(failed);
+    expect(events).not.toContain("retire-old");
+  });
+
+  it("does not restore a second writer when stopping the replacement is unconfirmed", async () => {
+    const events: string[] = [];
+    let activation!: DeferredDeployment;
+    await runDeployPipeline(retainedEnv(events, {
+      stopActivated: async () => { throw new Error("daemon unavailable"); },
+    }), makeInput({ deferCompletion: value => { activation = value; } }), fakeLogger());
+    const result = await activation.rollback(new Error("readiness failed"));
+    expect(result.restoredPreviousContainerId).toBeUndefined();
+    expect(events).not.toContain("restore-old");
+    expect(events).not.toContain("retire-old");
+  });
+
+  it.each([false, true])("honors cancellation during the stack checks (keep resources: %s)", async keep => {
+    const events: string[] = [];
+    const controller = new AbortController();
+    let keepProvisioned = false;
+    let activation!: DeferredDeployment;
+    await runDeployPipeline(retainedEnv(events), makeInput({
+      signal: controller.signal,
+      keepProvisionedOnCancel: () => keepProvisioned,
+      deferCompletion: value => { activation = value; },
+    }), fakeLogger());
+    keepProvisioned = keep;
+    controller.abort();
+    await expect(activation.complete()).resolves.toMatchObject({ status: "cancelled" });
+    expect(events).not.toContain("retire-old");
+    expect(events.includes("stop-new")).toBe(!keep);
+    expect(events.includes("restore-old")).toBe(!keep);
+  });
+});
+
+// Domains are optional; routing failures remain warnings on a live deployment.
 describe("runDeployPipeline routing is best-effort", () => {
   const domain = { hostname: "app.example.com", tls: false, targetPort: 3000 };
 

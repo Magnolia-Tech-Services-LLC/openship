@@ -68,6 +68,8 @@ import {
   type ContainerInfo,
   type DeployConfig,
   type DeployEnvironment,
+  type DeferredDeployment,
+  type DeployPipelineResult,
   type LogEntry,
   type MultiServiceDeployConfig,
   type MultiServiceDeployResult,
@@ -945,12 +947,22 @@ export async function deployComposeServices(
   logger: BuildLogger,
   opts?: ComposeDeployOptions,
 ): Promise<ComposeDeployResult> {
-  const runUnlocked = (): Promise<ComposeDeployResult> => {
+  const deferred = new Map<string, DeferredDeployment>();
+  const runUnlocked = async (): Promise<ComposeDeployResult> => {
     throwIfDeploymentCancelled(opts?.signal);
-    const run = () => deployComposeServicesUnlocked(project, dep, runtime, logger, opts);
-    return opts?.signal && opts.executor?.runWithAbortSignal
-      ? opts.executor.runWithAbortSignal(opts.signal, run)
-      : run();
+    const run = () => deployComposeServicesUnlocked(project, dep, runtime, logger, deferred, opts);
+    try {
+      return await (opts?.signal && opts.executor?.runWithAbortSignal
+        ? opts.executor.runWithAbortSignal(opts.signal, run)
+        : run());
+    } catch (error) {
+      if (!deploymentCancellationKeepsProvisioned(opts?.signal)) {
+        for (const activation of deferred.values()) {
+          await rollbackServiceActivation(runtime, activation, error, logger, opts?.signal);
+        }
+      }
+      throw error;
+    }
   };
   // Provider ingress owns Cloud port allocation. Keep this boundary consistent
   // with the topology below; a shared Docker runtime does not imply a local edge.
@@ -970,11 +982,32 @@ export async function deployComposeServices(
   return withHostPortTargetLock(target, runUnlocked, opts?.signal);
 }
 
+/** Late readiness failures use the same rollback as activation failures. */
+async function rollbackServiceActivation(
+  runtime: MultiServiceRuntimeAdapter,
+  activation: DeferredDeployment,
+  error: unknown,
+  logger: BuildLogger,
+  signal?: AbortSignal,
+): Promise<DeployPipelineResult> {
+  const result = await activation.rollback(error);
+  if (result.status !== "ready" && result.containerId && !deploymentCancellationKeepsProvisioned(signal)) {
+    try {
+      await runtime.destroy(result.containerId);
+    } catch (cleanupError) {
+      observeCaughtError(cleanupError, "platform/engine/modules/deployments/compose/deploy.service");
+      logger.log(`Warning: failed replacement cleanup remains pending: ${safeErrorMessage(cleanupError)}\n`, "warn");
+    }
+  }
+  return result;
+}
+
 async function deployComposeServicesUnlocked(
   project: Project,
   dep: Deployment,
   runtime: MultiServiceRuntimeAdapter,
   logger: BuildLogger,
+  deferred: Map<string, DeferredDeployment>,
   opts?: ComposeDeployOptions,
 ): Promise<ComposeDeployResult> {
   // Generated app secrets, BEFORE any env is read below. A catalog app whose install died
@@ -1617,6 +1650,28 @@ async function deployComposeServicesUnlocked(
       : new Map<string, Set<number>>();
 
   const results: ComposeDeployResult["services"] = [];
+  const recordRestoredService = async (
+    result: ComposeDeployResult["services"][number],
+    restoredId: string | undefined,
+  ) => {
+    const previous = previousByServiceId.get(result.serviceId);
+    if (!restoredId || previous?.containerId !== restoredId) return;
+    Object.assign(result, {
+      containerId: restoredId,
+      ip: previous.ip ?? undefined,
+      hostPort: previous.hostPort ?? undefined,
+      hostPortByContainerPort: previous.hostPorts ?? undefined,
+    });
+    // A kept partial must describe the runtime actually restored, including the
+    // old digest. Recording the failed image here would hide the pending update.
+    await repos.service.upsertServiceDeployment({
+      deploymentId: dep.id, serviceId: result.serviceId, serviceName: result.serviceName,
+      status: "failure", containerId: restoredId,
+      imageRef: previous.imageRef, imageDigest: previous.imageDigest,
+      ip: previous.ip, hostPort: previous.hostPort, hostPorts: previous.hostPorts,
+      allocatedResources: previous.allocatedResources,
+    });
+  };
   const portChecks: PortCheckResult[] = [];
   /** Exposed services to port-probe, collected in the deploy loop and run together
    *  after it (see the concurrent audit below). */
@@ -3191,6 +3246,7 @@ async function deployComposeServicesUnlocked(
       // persist every binding reported before the transport disappeared.
       let serviceResult: MultiServiceDeployResult | undefined;
       let pipelineReachedReady = false;
+      let restoredPreviousId: string | undefined;
       try {
         // Ownership transfers from the outer exact-cohort cleanup to this
         // service only once its own failure handler is active.
@@ -3232,6 +3288,9 @@ async function deployComposeServicesUnlocked(
             proxyRoutes.length > 0
               ? async (containerId, port) => {
                   const sameSvc = serviceResult?.containerId === containerId;
+                  const restoring = containerId === previous?.containerId;
+                  const previousHostPorts = new Map(Object.entries(previous?.hostPorts ?? {})
+                    .map(([containerPort, hostPort]) => [Number(containerPort), hostPort]));
                   // Prefer the port WE pinned+published for THIS container port
                   // (deterministic); fall back to the port the deploy result
                   // reported. That fallback is a single scalar read off the daemon,
@@ -3239,10 +3298,10 @@ async function deployComposeServicesUnlocked(
                   // a secondary port is the collapse this map exists to prevent.
                   const hostPort = upstreamHostPortFor({
                     port,
-                    pinned: pinnedHostPortByContainerPort,
+                    pinned: restoring ? previousHostPorts : pinnedHostPortByContainerPort,
                     primaryPort: primaryRoutedPort,
-                    resultHostPort: serviceResult?.hostPort,
-                    sameService: sameSvc,
+                    resultHostPort: restoring ? previous?.hostPort ?? undefined : serviceResult?.hostPort,
+                    sameService: restoring || sameSvc,
                   });
                   // The effective topology, not only the stored preference, decides
                   // whether to dial the reserved publish or the container IP.
@@ -3282,7 +3341,10 @@ async function deployComposeServicesUnlocked(
             ssl: routeDomains.length ? routeContext?.trackedSsl : undefined,
             routeOptions: routeDomains.length ? routeContext?.routeOptions : undefined,
             signal: opts?.signal,
-            keepProvisionedOnCancel: deploymentCancellationKeepsProvisioned(opts?.signal),
+            keepProvisionedOnCancel: () => deploymentCancellationKeepsProvisioned(opts?.signal),
+            ...(runtime instanceof DockerRuntime ? {
+              deferCompletion: (activation: DeferredDeployment) => deferred.set(svc.id, activation),
+            } : {}),
           },
           serviceLogger,
         );
@@ -3311,13 +3373,14 @@ async function deployComposeServicesUnlocked(
         }
 
         if (deployResult.status === "failed") {
+          restoredPreviousId = deployResult.restoredPreviousContainerId;
           // A CONNECTION-LOSS failure means the container STARTED but a post-start
           // step (health / route) couldn't reach the host (e.g. a stale-connection
           // "Channel open failure" during route registration). Keep it running —
           // the catch below marks it `indeterminate` so the deploy RECONCILES
           // instead of hard-failing and destroying a healthy container. Only a
           // genuine failure destroys the container here.
-          if (deployedContainerId && !isConnectionLoss(deployResult.error)) {
+          if (deployedContainerId && (restoredPreviousId || !isConnectionLoss(deployResult.error))) {
             try {
               await runtime.destroy(deployedContainerId);
               deployedContainerCleaned = true;
@@ -3538,7 +3601,7 @@ async function deployComposeServicesUnlocked(
         // be running fine — and do NOT mark it failed. Record `indeterminate` so
         // the deploy resolves to `reconciling`; reconciliation reads the true
         // remote state and settles it to ready/failed later.
-        if (isConnectionLoss(err) && deployedContainerId && !deployedContainerCleaned) {
+        if (isConnectionLoss(err) && deployedContainerId && !deployedContainerCleaned && !restoredPreviousId) {
           logger.log(
             `Service "${svc.name}" — connection lost after container start; will verify on reconcile.\n`,
             "warn",
@@ -3640,20 +3703,19 @@ async function deployComposeServicesUnlocked(
             error: message,
           });
 
+          const failedResult: ComposeDeployResult["services"][number] = {
+            serviceId: svc.id, serviceName: svc.name, status: "failed", error: message,
+          };
+          await recordRestoredService(failedResult, restoredPreviousId);
           await repos.service.markServiceDeploymentFailed({
             deploymentId: dep.id,
             serviceId: svc.id,
             serviceName: svc.name,
-            imageRef: image,
+            imageRef: restoredPreviousId ? previousByServiceId.get(svc.id)?.imageRef : image,
             errorMessage: message,
           });
 
-          results.push({
-            serviceId: svc.id,
-            serviceName: svc.name,
-            status: "failed",
-            error: message,
-          });
+          results.push(failedResult);
           unavailableServiceNames.add(svc.name);
         }
       }
@@ -3973,6 +4035,37 @@ async function deployComposeServicesUnlocked(
     }
     if (prepareSteps.length > 0 && !prepareFailure) {
       sessionManager.broadcastInstallPhase(dep.id, { id: "app-setup", status: "done" });
+    }
+  }
+  // Readiness runs only once every peer exists. Healthy services commit
+  // independently; failed services restore their predecessors. The existing
+  // partial-deployment Keep / Retry / Reject decision remains unchanged.
+  for (const [serviceId, activation] of deferred) {
+    throwIfDeploymentCancelled(opts?.signal);
+    const result = results.find(service => service.serviceId === serviceId);
+    const error = prepareFailure ?? (result?.status === "failed" ? result.error ?? "Service readiness failed" : null);
+    let settled = error
+      ? await rollbackServiceActivation(runtime, activation, new Error(error), logger, opts?.signal)
+      : await activation.complete();
+    if (settled.status !== "ready" && !error) {
+      settled = await rollbackServiceActivation(runtime, activation, new Error(settled.error), logger, opts?.signal);
+    }
+    deferred.delete(serviceId);
+    // Initial route warnings were already collected when activation returned.
+    if (settled.status !== "ready" && settled.routeWarnings?.length) {
+      composeRouteWarnings.push(...settled.routeWarnings);
+    }
+    if (settled.status === "cancelled") throw new Error("Deployment cancelled");
+    if (settled.status !== "ready" && result) {
+      if (result.status !== "failed") successful = Math.max(0, successful - 1);
+      result.status = "failed";
+      result.error = error ?? settled.error ?? "Service deployment failed";
+      await recordRestoredService(result, settled.restoredPreviousContainerId);
+      await repos.service.markServiceDeploymentFailed({
+        deploymentId: dep.id, serviceId, serviceName: result.serviceName,
+        imageRef: settled.restoredPreviousContainerId ? previousByServiceId.get(serviceId)?.imageRef : undefined,
+        errorMessage: result.error,
+      });
     }
   }
   const deployed = results.filter((r) => r.status !== "failed" && !r.carried).length;

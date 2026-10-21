@@ -142,6 +142,7 @@ export {
   type DeployRouting,
   type DeployPipelineInput,
   type DeployPipelineResult,
+  type DeferredDeployment,
   type PromptPayload,
   type PromptUserFn,
   runDeployPipeline,

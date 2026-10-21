@@ -45,6 +45,7 @@ const h = vi.hoisted(() => ({
 
 vi.mock("@repo/db", () => ({
   repos: {
+    serviceDeployment: { listByDeployment: async () => [], update: async () => undefined },
     server: {
       get: async () => h.localRow,
       getInOrganization: async () => h.localRow,
@@ -2337,6 +2338,168 @@ describe("compose deploy — host channel unavailable", () => {
 });
 
 vi.mock("@repo/platform/engine/lib/platform-config", () => ({ platform: () => ({ target: "selfhosted" }) }));
+
+it("restores a failed service after stack health checks while retaining the successful peer", async () => {
+  const f = imageRefreshFixture();
+  const events: string[] = [];
+  let oldExists = true;
+  h.services[1]!.advanced = { readiness: { stabilization: true, stabilizationSeconds: 0.001, onFailure: "fail" } };
+  vi.mocked(f.runtime.destroy).mockImplementation(async id => {
+    events.push(`destroy:${id}`);
+    if (id === "old-api") oldExists = false;
+  });
+  vi.mocked(f.runtime.start).mockImplementation(async id => { events.push(`start:${id}`); });
+  vi.mocked(f.runtime.stop).mockImplementation(async id => { events.push(`stop:${id}`); });
+  h.previousServiceRows[1]!.imageDigest = "sha256:old-api-image";
+  const audit = await import("@repo/platform/engine/modules/deployments/stability-audit.service");
+  const verification = vi.spyOn(audit, "verifyDeployedContainers").mockImplementation(async (_runtime, targets) => {
+    events.push("health");
+    return targets.filter(target => target.serviceName === "api").map(target => ({ target, verdict: { ok: false, status: "exited", reason: "bad image exits" },
+      summary: "bad image exits", detail: "bad image exits" })) as never;
+  });
+  try {
+    const result = await f.run({ targetServiceIds: new Set(["svc-db", "svc-api"]) });
+    expect(result.services.find(service => service.serviceId === "svc-api"))
+      .toMatchObject({ status: "failed", containerId: "old-api", ip: "172.18.0.2" });
+    expect(result.services.find(service => service.serviceId === "svc-db"))
+      .toMatchObject({ status: "running", containerId: "new-db" });
+    expect(result.summary).toMatchObject({ successful: 1, failed: 1 });
+    expect(events).not.toContain("destroy:old-api");
+    expect(events).toContain("destroy:old-db");
+    expect(events).toContain("destroy:new-api");
+    expect(events.indexOf("health")).toBeLessThan(events.indexOf("destroy:old-db"));
+    expect(events.indexOf("health")).toBeLessThan(events.indexOf("stop:new-api"));
+    expect(events.indexOf("stop:new-api")).toBeLessThan(events.indexOf("start:old-api"));
+    expect(oldExists).toBe(true);
+    expect(h.upsertServiceDeployment).toHaveBeenLastCalledWith(expect.objectContaining({
+      serviceId: "svc-api", status: "failure", containerId: "old-api", imageDigest: "sha256:old-api-image",
+    }));
+  } finally { verification.mockRestore(); }
+});
+
+it.each(["fail", "warn"])("honors the readiness probe policy before retiring the predecessor: %s", async onFailure => {
+  const f = imageRefreshFixture();
+  h.services[1]!.advanced = { readiness: { enabled: true, port: 3000, onFailure } };
+  const readiness = await import("@repo/platform/engine/modules/deployments/readiness-probe");
+  const probe = vi.spyOn(readiness, "probeDeployedReadiness").mockImplementation(async () => {
+    expect(f.runtime.destroy).not.toHaveBeenCalledWith("old-api");
+    return { failure: "readiness endpoint returned 503" };
+  });
+  try {
+    const result = await f.run({ targetServiceIds: new Set(["svc-api"]) });
+    const service = result.services.find(service => service.serviceId === "svc-api");
+    expect(service?.status).toBe(onFailure === "fail" ? "failed" : "running");
+    if (onFailure === "fail") {
+      expect(f.runtime.start).toHaveBeenCalledExactlyOnceWith("old-api");
+      expect(f.runtime.destroy).toHaveBeenCalledWith("new-api");
+      expect(f.runtime.destroy).not.toHaveBeenCalledWith("old-api");
+    } else {
+      expect(f.runtime.start).not.toHaveBeenCalled();
+      expect(f.runtime.destroy).toHaveBeenCalledExactlyOnceWith("old-api");
+    }
+  } finally { probe.mockRestore(); }
+});
+
+it.each([false, true])("preserves cancellation during stack health checks (keep resources: %s)", async keepProvisioned => {
+  const f = imageRefreshFixture();
+  h.services[1]!.advanced = { readiness: { stabilization: true, onFailure: "fail" } };
+  const cancellation = await import("@repo/platform/engine/modules/deployments/deployment-cancellation");
+  const signal = cancellation.registerDeploymentExecution(dep.id);
+  const audit = await import("@repo/platform/engine/modules/deployments/stability-audit.service");
+  const verification = vi.spyOn(audit, "verifyDeployedContainers").mockImplementation(async () => {
+    cancellation.requestDeploymentCancellation(dep.id, { keepProvisioned });
+    return [];
+  });
+  try {
+    await expect(f.run({ targetServiceIds: new Set(["svc-api"]), signal })).rejects.toThrow("cancelled");
+    expect(f.runtime.destroy).not.toHaveBeenCalledWith("old-api");
+    if (keepProvisioned) {
+      expect(f.runtime.start).not.toHaveBeenCalled();
+      expect(f.runtime.stop).not.toHaveBeenCalledWith("new-api");
+      expect(f.runtime.destroy).not.toHaveBeenCalled();
+    } else {
+      expect(f.runtime.stop).toHaveBeenCalledWith("new-api");
+      expect(f.runtime.start).toHaveBeenCalledExactlyOnceWith("old-api");
+      expect(f.runtime.destroy).toHaveBeenCalledExactlyOnceWith("new-api");
+    }
+  } finally {
+    verification.mockRestore();
+    cancellation.releaseDeploymentExecution(dep.id, signal);
+  }
+});
+
+it("restores the predecessor's loopback route when the failed replacement used another host port", async () => {
+  const f = imageRefreshFixture();
+  Object.assign(h.services[1]!, { ports: ["3000"], exposed: true, exposedPort: "3000",
+    domainType: "custom", customDomain: "api.example.com",
+    advanced: { readiness: { enabled: true, port: 3000, onFailure: "fail" } } });
+  Object.assign(h.previousServiceRows[1]!, { hostPort: 20_008, hostPorts: { 3000: 20_008 } });
+  vi.mocked(f.runtime.getContainerInfo).mockImplementation(async id => ({
+    containerId: id, status: "running", ip: "172.18.0.2", imageId: id === "old-db" ? f.dbId : f.apiId,
+    ...(id === "old-api" ? { hostPort: 20_008, hostPortByContainerPort: { 3000: 20_008 } } : {}),
+  }));
+  const readiness = await import("@repo/platform/engine/modules/deployments/readiness-probe");
+  const probe = vi.spyOn(readiness, "probeDeployedReadiness").mockResolvedValue({ failure: "not ready" });
+  const registerRoute = vi.fn(async (_route: { domain: string; targetUrl?: string }) => undefined);
+  try {
+    const result = await deployComposeServices(
+      { ...project, activeDeploymentId: "d-old", routeStrategy: "loopback-port" } as Project,
+      dep, f.runtime, f.logger, { targetServiceIds: new Set(["svc-api"]),
+        executor: { exec: async () => "" } as never, hostPortTarget: localHostPortTarget,
+        routing: { registerRoute, removeRoute: vi.fn() } as never,
+        ssl: { provisionCert: vi.fn(async () => ({ verified: false })) } as never,
+        usesManagedRouting: true },
+    );
+    const routes = registerRoute.mock.calls.map(([route]) => route)
+      .filter(route => route.domain === "api.example.com");
+    expect(routes.map(route => route.targetUrl)).toEqual(["http://127.0.0.1:30000", "http://127.0.0.1:20008"]);
+    expect(result.services.find(service => service.serviceId === "svc-api"))
+      .toMatchObject({ status: "failed", containerId: "old-api", hostPort: 20_008,
+        hostPortByContainerPort: { 3000: 20_008 } });
+  } finally { probe.mockRestore(); }
+});
+
+it("cleans a recovered create before restoring the old service so a loopback retry succeeds", async () => {
+  const f = imageRefreshFixture();
+  let oldExists = true;
+  let orphanExists = false;
+  const supports = f.runtime.supports.bind(f.runtime);
+  Object.assign(f.runtime, {
+    supports: (capability: string) => capability === "hostContainerQuery" || supports(capability as never),
+    listAllContainers: async () => {
+      const container = (id: string, service: string, state: string) => ({
+        id, names: [`openship-app-${service}-${id}`], image: service === "api" ? f.apiRef : f.dbRef,
+        imageId: service === "api" ? f.apiId : f.dbId, state, status: state === "running" ? "Up 1 hour" : "Created",
+        labels: { "openship.project": "p1", "openship.service": service }, ports: [], mounts: [], ip: "172.18.0.2",
+      });
+      return [container("old-db", "db", "running"),
+        ...(oldExists ? [container("old-api", "api", "running")] : []),
+        ...(orphanExists ? [container("orphan-api", "api", "created")] : [])];
+    },
+  });
+  vi.mocked(f.runtime.destroy).mockImplementation(async id => {
+    if (id === "old-api") oldExists = false;
+    if (id === "orphan-api") orphanExists = false;
+  });
+  f.activate.mockImplementation(async (_group, config) => {
+    // The adapter recovered the ID by name after the create response was lost.
+    orphanExists = true;
+    (config as { onContainerCreated?: (id: string) => void }).onContainerCreated?.("orphan-api");
+    throw new Error("socket hang up");
+  });
+  const run = () => deployComposeServices(
+    { ...project, activeDeploymentId: "d-old", routeStrategy: "loopback-port" } as Project,
+    dep, f.runtime, f.logger, { targetServiceIds: new Set(["svc-api"]),
+      executor: { exec: async () => "" } as never, hostPortTarget: localHostPortTarget },
+  );
+  const first = await run();
+  expect(first.services.find(service => service.serviceId === "svc-api")?.status).toBe("failed");
+  expect(oldExists).toBe(true);
+  expect(orphanExists).toBe(false);
+  f.activate.mockResolvedValue({ status: "running", containerId: "recovered-api", ip: "172.18.0.3" });
+  await expect(run()).resolves.toMatchObject({ status: "ready" });
+  expect(f.activate).toHaveBeenCalledTimes(2);
+});
 
 it("rejects an invalid GPU request before pulling images or replacing any sibling", async () => {
   const fixture = imageRefreshFixture();

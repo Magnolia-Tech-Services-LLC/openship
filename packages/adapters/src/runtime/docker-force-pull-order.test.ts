@@ -32,6 +32,78 @@ const CONFIG: MultiServiceDeployConfig = {
 };
 
 describe("Docker service replacement ordering", () => {
+  it("recovers an owned replacement ID when Docker accepted create but lost its response", async () => {
+    const createdId = "b".repeat(64);
+    const failure = new Error("socket hang up");
+    const onContainerCreated = vi.fn();
+    const start = vi.fn();
+    const remove = vi.fn();
+    const docker = {
+      getImage: () => ({ inspect: async () => ({ Config: {} }) }),
+      createContainer: vi.fn().mockRejectedValue(failure),
+      getContainer: vi.fn(() => ({ start, remove, inspect: async () => ({
+        Id: createdId, Config: { Labels: { "openship.project": CONFIG.projectId,
+          "openship.deployment": CONFIG.deploymentId, "openship.service": CONFIG.serviceName } },
+      }) })),
+    };
+    const runtime = await DockerRuntime.create({ dockerSocketPath: "/tmp/openship-test-absent.sock" });
+    (runtime as unknown as { _docker: unknown })._docker = docker;
+    await expect(runtime.deployServiceWorkload(GROUP, {
+      ...CONFIG, previousContainerId: "old-container", imageAlreadyPrepared: true, onContainerCreated,
+    })).rejects.toBe(failure);
+    expect(onContainerCreated).toHaveBeenCalledExactlyOnceWith(createdId);
+    expect(docker.getContainer).toHaveBeenCalledWith(docker.createContainer.mock.calls[0]![0].name);
+    expect(start).not.toHaveBeenCalled();
+    expect(remove).not.toHaveBeenCalled();
+  });
+
+  it.each(["openship.project", "openship.deployment", "openship.service", "openship.role"])(
+    "does not recover a container with mismatched ownership: %s", async label => {
+      const failure = new Error("name already in use");
+      const onContainerCreated = vi.fn();
+      const remove = vi.fn();
+      const docker = {
+        getImage: () => ({ inspect: async () => ({ Config: {} }) }),
+        createContainer: vi.fn().mockRejectedValue(failure),
+        getContainer: () => ({ remove, inspect: async () => ({ Id: "b".repeat(64),
+          Config: { Labels: { "openship.project": CONFIG.projectId,
+            "openship.deployment": CONFIG.deploymentId, "openship.service": CONFIG.serviceName,
+            [label]: "another-owner" } },
+        }) }),
+      };
+      const runtime = await DockerRuntime.create({ dockerSocketPath: "/tmp/openship-test-absent.sock" });
+      (runtime as unknown as { _docker: unknown })._docker = docker;
+      await expect(runtime.deployServiceWorkload(GROUP, {
+        ...CONFIG, previousContainerId: "old-container", imageAlreadyPrepared: true, onContainerCreated,
+      })).rejects.toBe(failure);
+      expect(onContainerCreated).not.toHaveBeenCalled();
+      expect(remove).not.toHaveBeenCalled();
+    },
+  );
+
+  it("reports the created ID but does not start it when cancelled during create", async () => {
+    const controller = new AbortController();
+    const onContainerCreated = vi.fn();
+    const start = vi.fn();
+    const remove = vi.fn();
+    const docker = {
+      getImage: () => ({ inspect: async () => ({ Config: {} }) }),
+      createContainer: vi.fn(async () => {
+        controller.abort();
+        return { id: "new-api", start, remove };
+      }),
+    };
+    const runtime = await DockerRuntime.create({ dockerSocketPath: "/tmp/openship-test-absent.sock" });
+    (runtime as unknown as { _docker: unknown })._docker = docker;
+    await expect(runtime.deployServiceWorkload(GROUP, {
+      ...CONFIG, previousContainerId: "old-container", imageAlreadyPrepared: true,
+      signal: controller.signal, onContainerCreated,
+    })).rejects.toThrow();
+    expect(onContainerCreated).toHaveBeenCalledExactlyOnceWith("new-api");
+    expect(start).not.toHaveBeenCalled();
+    expect(remove).not.toHaveBeenCalled();
+  });
+
   it("does not remove the retained release by its legacy name when replacement creation fails", async () => {
     const remove = vi.fn(async () => undefined);
     const docker = {
